@@ -12,9 +12,11 @@ from googleapiclient.discovery import build
 warnings.filterwarnings("ignore", module="google_auth_httplib2")
 
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1vbJOCrOp_NGBKnY5uQHgRUzxiHPi_BaNxkDiHr0W16I/edit"
-DOC_ID = "1kLbI8B98J2HTtlFn6Byz0fZhe6LfhuCKoM2Zb2MDsZE"
 READABLE_DOC_ID = "16MIqR6XZp9y0S_qoChHSRd0N5qMKdwoRG28w4YhsusU"
 KST = timezone(timedelta(hours=9))
+
+APPLY_LOG_SHEET_NAME = "반영로그"
+APPLY_LOG_HEADERS = ["No", "시각", "제목", "JSON", "상점현황_JSON", "실행취소"]
 
 _docs_service = None
 _creds = None
@@ -73,17 +75,17 @@ def print_apply_summary(result: ApplyResult) -> None:
         print(f"  └ {result.sheet_error}")
     if result.sheet_ok:
         if result.machine_log_ok and result.machine_log_no:
-            print(f"[기계 로그]     {_status(True)} → No. {result.machine_log_no} (실행취소용)")
+            print(f"[반영로그]    {_status(True)} → No. {result.machine_log_no} (실행취소용)")
         else:
-            print(f"[기계 로그]     {_status(False)}")
+            print(f"[반영로그]    {_status(False)}")
             if result.machine_log_error:
                 print(f"  └ {result.machine_log_error}")
         if result.machine_log_ok:
-            print(f"[조회용 로그]   {_status(result.readable_log_ok)}")
+            print(f"[상점 반영기록]   {_status(result.readable_log_ok)}")
             if result.readable_log_error:
                 print(f"  └ {result.readable_log_error}")
         else:
-            print("[조회용 로그]   ⏭️ 건너뜀 (기계 로그 없음)")
+            print("[상점 반영기록]   ⏭️ 건너뜀 (반영로그 없음)")
     for w in result.warnings:
         print(f"⚠️ {w}")
     print("-" * 42)
@@ -91,19 +93,19 @@ def print_apply_summary(result: ApplyResult) -> None:
         print("전체 상태: ✅ 완료 (시트 + 로그 모두 반영)")
     elif result.is_dangerous:
         print("전체 상태: ⚠️ 부분 성공 (위험)")
-        print("  점수는 시트에 반영되었으나 기계 로그가 없습니다.")
-        print("  → 실행취소 도구로 복구할 수 없습니다. 수동 조정 또는 로그 재기록이 필요합니다.")
+        print("  점수는 시트에 반영되었으나 반영로그 기록이 없습니다.")
+        print("  → 실행취소 도구로 복구할 수 없습니다. 수동 조정이 필요합니다.")
     elif not result.sheet_ok:
         print("전체 상태: ❌ 시트 반영 실패")
     else:
         print("전체 상태: ⚠️ 부분 성공")
-        print("  → 조회용 로그만 실패한 경우, 기계 로그 No.로 내역 확인은 가능합니다.")
+        print("  → 상점 반영기록만 실패한 경우, 반영로그 No.로 실행취소는 가능합니다.")
     print("=" * 42 + "\n")
 
 
 def require_common():
     if "ensure_gspread" not in globals():
-        raise RuntimeError("먼저 「공통 라이브러리」 셀을 실행해 주세요.")
+        raise RuntimeError("도구 셀을 실행해 공통 라이브러리를 먼저 로드해 주세요.")
 
 
 def ensure_gspread():
@@ -141,38 +143,173 @@ def _get_docs_service():
     return _docs_service
 
 
-def _get_next_log_no(service, doc_id: str) -> int:
-    document = service.documents().get(documentId=doc_id).execute()
-    full_text = _extract_full_text(document)
-    existing_numbers = re.findall(r">>>\s*\[No\.\s*(\d+)\]", full_text)
-    return int(max(existing_numbers, key=int)) + 1 if existing_numbers else 1
-
-
-def append_log_to_doc(doc_id: str, title_text: str, content_dict: dict, timestamp: str) -> tuple[int, str | None]:
-    """기계 판독용 로그 삽입. (로그 번호, 오류 메시지) 반환."""
+def _parse_log_no_cell(val) -> int | None:
     try:
-        service = _get_docs_service()
-        next_no = _get_next_log_no(service, doc_id)
-        log_header = f"\n>>> [No. {next_no}] {title_text} | {timestamp} <<<\n"
-        log_body = f"<D:>{json.dumps(content_dict, ensure_ascii=False)}</D>\n"
-        divider = "-" * 40 + "\n"
-        full_text_to_insert = log_header + log_body + divider
-        header_end = 1 + len(log_header)
-        body_end = 1 + len(full_text_to_insert)
-        requests = [
-            {"insertText": {"location": {"index": 1}, "text": full_text_to_insert}},
-            {"updateTextStyle": {
-                "range": {"startIndex": 1, "endIndex": header_end},
-                "textStyle": {"bold": True, "foregroundColor": {"color": {"rgbColor": {"blue": 0.8}}}},
-                "fields": "bold,foregroundColor",
-            }},
-            {"updateTextStyle": {
-                "range": {"startIndex": header_end, "endIndex": body_end},
-                "textStyle": {"bold": False, "foregroundColor": {}},
-                "fields": "bold,foregroundColor",
-            }},
-        ]
-        service.documents().batchUpdate(documentId=doc_id, body={"requests": requests}).execute()
+        return int(float(str(val).strip()))
+    except (ValueError, TypeError):
+        return None
+
+
+def get_or_create_log_index_sheet():
+    return get_or_create_worksheet(sh, APPLY_LOG_SHEET_NAME, APPLY_LOG_HEADERS)
+
+
+def allocate_next_log_no(ws=None) -> int:
+    """`반영로그` 시트 A열 기준 다음 No."""
+    if ws is None:
+        ws = get_or_create_log_index_sheet()
+    col = ws.col_values(1)
+    nums = [_parse_log_no_cell(v) for v in col[1:]]
+    nums = [n for n in nums if n is not None]
+    return max(nums) + 1 if nums else 1
+
+
+def encode_store_snapshot(rows: list) -> str:
+    """상점현황 전체를 JSON 문자열로 (반영 직후 스냅샷)."""
+    snapshot = [
+        [r[0].strip(), r[1] if len(r) > 1 else ""]
+        for r in rows
+        if r and str(r[0]).strip()
+    ]
+    return json.dumps(snapshot, ensure_ascii=False)
+
+
+def decode_store_snapshot(raw: str) -> list[list[str]]:
+    data = json.loads(raw.strip())
+    if not isinstance(data, list):
+        raise ValueError("상점현황_JSON 형식이 올바르지 않습니다.")
+    return [[str(c) for c in row] for row in data]
+
+
+def _log_undo_col_1based(row: list) -> int:
+    """실행취소 열 (1-based). 신규 6열=6, 구형 5열=5."""
+    return 6 if len(row) >= 6 else 5
+
+
+def append_log_index_row(
+    log_no: int,
+    timestamp: str,
+    title: str,
+    content_dict: dict,
+    store_snapshot_json: str = "",
+    *,
+    ws=None,
+) -> str | None:
+    """반영로그 시트에 한 행 추가. 실패 시 오류 메시지."""
+    try:
+        if ws is None:
+            ws = get_or_create_log_index_sheet()
+        ws.append_row(
+            [
+                log_no,
+                timestamp,
+                title,
+                json.dumps(content_dict, ensure_ascii=False),
+                store_snapshot_json,
+                "",
+            ],
+            value_input_option="USER_ENTERED",
+        )
+        return None
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
+def get_log_index_entry(target_no: int) -> dict | None:
+    """반영로그 한 건: changes, store_snapshot_json, meta."""
+    try:
+        ws = get_or_create_log_index_sheet()
+        for i, row in enumerate(ws.get_all_values()[1:], start=2):
+            if len(row) < 4:
+                continue
+            if _parse_log_no_cell(row[0]) != target_no:
+                continue
+            changes = None
+            try:
+                changes = json.loads(row[3].strip())
+            except (json.JSONDecodeError, Exception):
+                pass
+            store_snapshot_json = ""
+            if len(row) >= 6:
+                store_snapshot_json = row[4].strip()
+            undo_col = _log_undo_col_1based(row)
+            undone_raw = row[undo_col - 1].strip() if len(row) >= undo_col else ""
+            return {
+                "row": i,
+                "no": target_no,
+                "timestamp": row[1] if len(row) > 1 else "",
+                "title": row[2] if len(row) > 2 else "",
+                "changes": changes,
+                "store_snapshot_json": store_snapshot_json,
+                "undone": undone_raw.upper() in ("Y", "YES", "예", "실행취소") or bool(undone_raw),
+                "undo_col": undo_col,
+            }
+    except Exception:
+        pass
+    return None
+
+
+def get_log_index_meta(target_no: int) -> dict | None:
+    entry = get_log_index_entry(target_no)
+    if not entry:
+        return None
+    return {
+        "row": entry["row"],
+        "no": entry["no"],
+        "timestamp": entry["timestamp"],
+        "title": entry["title"],
+        "undone": entry["undone"],
+        "undo_col": entry.get("undo_col", 6),
+    }
+
+
+def get_log_from_index(target_no: int) -> dict | None:
+    entry = get_log_index_entry(target_no)
+    if not entry:
+        return None
+    changes = entry.get("changes")
+    return changes if isinstance(changes, dict) else None
+
+
+def is_log_already_undone(target_no: int) -> bool:
+    meta = get_log_index_meta(target_no)
+    return bool(meta and meta["undone"])
+
+
+def mark_log_undone(target_no: int) -> str | None:
+    """반영로그 시트에 실행취소 표시."""
+    try:
+        entry = get_log_index_entry(target_no)
+        if entry is None:
+            return None
+        ws = get_or_create_log_index_sheet()
+        ws.update_cell(entry["row"], entry.get("undo_col", 6), "Y")
+        return None
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
+def append_machine_log(
+    title_text: str,
+    content_dict: dict,
+    timestamp: str,
+    store_rows: list | None = None,
+) -> tuple[int, str | None]:
+    """반영로그 시트에 변경 JSON + 상점현황 스냅샷 저장. (No, 오류) 반환."""
+    try:
+        index_ws = get_or_create_log_index_sheet()
+        next_no = allocate_next_log_no(index_ws)
+        snapshot = encode_store_snapshot(store_rows) if store_rows else ""
+        index_err = append_log_index_row(
+            next_no,
+            timestamp,
+            title_text,
+            content_dict,
+            snapshot,
+            ws=index_ws,
+        )
+        if index_err:
+            return -1, index_err
         return next_no, None
     except Exception as e:
         return -1, f"{type(e).__name__}: {e}"
@@ -182,9 +319,9 @@ def append_readable_log_to_doc(
     doc_id: str, title_text: str, timestamp: str, results_log: list[str], log_no: int,
     details_sort_helper: dict | None = None,
 ) -> str | None:
-    """조회용 로그 삽입. 실패 시 오류 메시지, 성공 시 None."""
+    """상점 반영기록(Docs) 삽입. 실패 시 오류 메시지, 성공 시 None."""
     if log_no is None or log_no < 1:
-        return "유효한 기계 로그 번호가 없어 조회용 로그를 건너뜁니다."
+        return "유효한 반영로그 번호가 없어 상점 반영기록을 건너뜁니다."
     try:
         service = _get_docs_service()
         log_header = f"\n[No. {log_no}] {title_text} | {timestamp}\n"
@@ -272,18 +409,9 @@ def col_letter(zero_based_idx: int) -> str:
     return chr(65 + zero_based_idx)
 
 
-def get_log_by_no(doc_id: str, target_no: int) -> tuple[dict | None, str]:
-    try:
-        service = _get_docs_service()
-        document = service.documents().get(documentId=doc_id).execute()
-        full_text = _extract_full_text(document)
-        pattern = rf">>>\s*\[No\.\s*{target_no}\]\s*.*?<<<.*?<D:>(.*?)</D>"
-        match = re.search(pattern, full_text, re.DOTALL)
-        if match:
-            return json.loads(match.group(1).strip()), full_text
-        return None, full_text
-    except Exception:
-        return None, ""
+def get_log_by_no(target_no: int) -> dict | None:
+    """실행취소용 JSON. `반영로그` 시트에서만 조회."""
+    return get_log_from_index(target_no)
 
 
 def load_alias_maps(map_data=None):
@@ -354,12 +482,13 @@ def write_dual_log(
     results_log: list[str],
     timestamp: str,
     details_sort_helper: dict | None = None,
+    store_rows: list | None = None,
 ) -> ApplyResult:
-    """기계·조회용 Docs 로그 기록. 시트 반영 여부는 포함하지 않는다."""
+    """반영로그 시트 + 상점 반영기록 기록. 상점 반영 여부는 포함하지 않는다."""
     result = ApplyResult(tool=title, timestamp=timestamp, member_count=len(log_dict))
-    log_no, machine_err = append_log_to_doc(DOC_ID, title, log_dict, timestamp)
-    if machine_err:
-        result.machine_log_error = machine_err
+    log_no, index_err = append_machine_log(title, log_dict, timestamp, store_rows=store_rows)
+    if index_err:
+        result.machine_log_error = index_err
     else:
         result.machine_log_ok = True
         result.machine_log_no = log_no
@@ -373,7 +502,80 @@ def write_dual_log(
         else:
             result.readable_log_ok = True
     else:
-        result.readable_log_error = "기계 로그 실패로 조회용 로그를 건너뜀"
+        result.readable_log_error = "반영로그 실패로 상점 반영기록을 건너뜀"
+    return result
+
+
+def restore_store_from_backup(log_no: int) -> ApplyResult:
+    """반영로그 No.의 상점현황_JSON으로 상점현황 시트 전체 복원."""
+    ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    title = f"No. {log_no} 백업 복원"
+    result = ApplyResult(tool=title, timestamp=ts)
+
+    entry = get_log_index_entry(log_no)
+    if not entry:
+        result.sheet_error = f"No. {log_no} 반영로그를 찾을 수 없습니다."
+        print_apply_summary(result)
+        return result
+
+    raw = entry.get("store_snapshot_json", "").strip()
+    if not raw:
+        result.sheet_error = "이 로그에 상점현황_JSON 백업이 없습니다. (구형 로그 또는 저장 실패)"
+        print_apply_summary(result)
+        return result
+
+    try:
+        rows = decode_store_snapshot(raw)
+        ws_store, _, _ = load_store_sheet()
+        member_count = len([r for r in rows if r and r[0].strip()])
+        result.member_count = member_count
+        print(f"\n[{title}] 상점현황 {member_count}명 복원 (No. {log_no} 시점)")
+        sheet_err = save_store_sheet(ws_store, rows)
+        if sheet_err:
+            result.sheet_error = sheet_err
+        else:
+            result.sheet_ok = True
+            result.warnings.append("백업 복원은 반영로그·상점 반영기록에 새 No.를 남기지 않습니다.")
+    except Exception as e:
+        result.sheet_error = f"{type(e).__name__}: {e}"
+
+    print_apply_summary(result)
+    return result
+
+
+def undo_store_log(log_no: int) -> ApplyResult | None:
+    """반영로그 No.의 변경 JSON을 역반영하여 실행취소."""
+    log_data = get_log_from_index(log_no)
+    if not log_data:
+        print(f"[알림] No. {log_no} 변경 JSON을 `반영로그`에서 찾을 수 없습니다.")
+        return None
+
+    ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    ctx = open_store_context()
+    undo_log_dict = {}
+    for member, point in log_data.items():
+        if not isinstance(point, (int, float)):
+            continue
+        target, _ = resolve_member(member, ctx["alias_to_real"], ctx["real_to_sheet"])
+        undo = -float(point)
+        undo_log_dict[target] = undo
+        if target not in ctx["name_idx"]:
+            print(f"[알림] '{target}'님을 상점현황에서 찾을 수 없어 건너뜁니다.")
+            continue
+        row = ctx["rows"][ctx["name_idx"][target]]
+        cur, new = apply_delta_to_row(row, undo)
+        ctx["results_log"].append(f"↩️ {target}: {cur} → {new} ({point:+} 취소)")
+
+    if not ctx["results_log"]:
+        print("[알림] 실행취소할 항목이 없습니다.")
+        return None
+
+    ctx["log_for_doc"] = undo_log_dict
+    result = store_finalize(ctx, f"No. {log_no} 실행취소", ts, banner=f"No. {log_no} 실행취소")
+    if result and result.sheet_ok:
+        mark_err = mark_log_undone(log_no)
+        if mark_err:
+            print(f"[경고] 반영로그 '실행취소' 표시 실패: {mark_err}")
     return result
 
 
@@ -450,7 +652,10 @@ def store_finalize(ctx: dict, title: str, timestamp: str, *, banner: str | None 
         result.sheet_ok = True
 
     if result.sheet_ok:
-        log_result = write_dual_log(title, ctx["log_for_doc"], ctx["results_log"], timestamp)
+        log_result = write_dual_log(
+            title, ctx["log_for_doc"], ctx["results_log"], timestamp,
+            store_rows=ctx["rows"],
+        )
         result.merge_log(log_result)
     else:
         result.warnings.append("시트 저장 실패로 로그 기록을 건너뜀")
@@ -531,6 +736,7 @@ def apply_calc_points_to_store(
             results_log,
             timestamp,
             details_sort_helper=details_sort_helper,
+            store_rows=rows,
         )
         result.merge_log(log_result)
     else:
@@ -544,9 +750,11 @@ def get_or_create_worksheet(spreadsheet, title: str, headers: list | None = None
     try:
         return spreadsheet.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=title, rows="1000", cols="5")
+        ncol = max(len(headers), 6) if headers else 6
+        ws = spreadsheet.add_worksheet(title=title, rows="1000", cols=str(ncol))
         if headers:
-            ws.update(range_name="A1:E1" if len(headers) == 5 else "A1", values=[headers])
+            end = col_letter(len(headers) - 1)
+            ws.update(range_name=f"A1:{end}1", values=[headers])
         return ws
 
 
@@ -584,23 +792,17 @@ def sync_not_received(ws, input_text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 시즌 규칙 (`규칙` 시트) · 설정 (`설정` 시트)
+# 공통 규칙 (`규칙` 시트 2행 단일) · 설정 (`설정` 시트)
 # ---------------------------------------------------------------------------
 
 RULES_SHEET_NAME = "규칙"
 SETTINGS_SHEET_NAME = "설정"
 
-# `규칙` 시트 1행 헤더 (이 순서로 붙여넣기 가능)
+# `규칙` 시트 1행 헤더 · 2행에 규칙 값 1세트만 둡니다.
 RULES_SHEET_HEADERS = [
-    "시즌", "용_rate", "용_allow", "기_rate", "기_allow", "감_rate", "감_allow",
+    "용_rate", "용_allow", "기_rate", "기_allow", "감_rate", "감_allow",
     "화요일_회당", "노참1", "노참2+", "전체1등", "전체2등", "전체3등",
     "보스1등", "보스2등", "3관왕", "부캐미참", "본캐미참",
-]
-
-RULES_COLUMN_KEYS = [
-    "season", "d_rate", "d_allow", "m_rate", "m_allow", "a_rate", "a_allow",
-    "tuesday_per", "no_acc_1", "no_acc_2plus", "rank_1", "rank_2", "rank_3",
-    "boss_rank_1", "boss_rank_2", "triple_crown", "sub_absent", "main_absent",
 ]
 
 
@@ -627,15 +829,14 @@ def _rules_cell(row: list, header: list[str], col_name: str, *, as_float: bool =
     return _parse_num(row[idx], as_float=as_float)
 
 
-def _row_to_rules_dict(header: list[str], row: list[str], season_id: str) -> dict:
+def _row_to_rules_dict(header: list[str], row: list[str]) -> dict:
     def need(col_name: str, **kwargs):
         v = _rules_cell(row, header, col_name, **kwargs)
         if v is None:
-            raise ValueError(f"규칙 시트 '{season_id}' 행에 '{col_name}' 값이 없습니다.")
+            raise ValueError(f"규칙 시트 2행에 '{col_name}' 값이 없습니다.")
         return v
 
     return {
-        "season": season_id,
         "bosses": {
             "dragon": {"rate": need("용_rate"), "allow": need("용_allow")},
             "machine": {"rate": need("기_rate"), "allow": need("기_allow")},
@@ -653,35 +854,31 @@ def _row_to_rules_dict(header: list[str], row: list[str], season_id: str) -> dic
     }
 
 
-def load_rules_for_season(season_id: str) -> dict:
+def load_rules(settlement_season: str | None = None) -> dict:
     """
-    `규칙` 시트에서 season_id(예: 30-1) 행을 찾아 규칙 dict를 반환한다.
-    없으면 ValueError (조용한 기본값 없음).
+    `규칙` 시트 1행=헤더, 2행=공통 규칙 1세트.
+    settlement_season은 스냅샷·미리보기용(정산 시즌 ID)이며 규칙 조회와 무관.
     """
-    season_id = season_id.strip()
     ws = sh.worksheet(RULES_SHEET_NAME)
     rows = [r for r in ws.get_all_values() if any(c.strip() for c in r)]
     if len(rows) < 2:
         raise ValueError(
-            f"'{RULES_SHEET_NAME}' 시트에 헤더(1행)와 시즌 데이터(2행~)가 필요합니다.\n"
+            f"'{RULES_SHEET_NAME}' 시트에 헤더(1행)와 규칙 데이터(2행)가 필요합니다.\n"
             f"헤더 예시: {', '.join(RULES_SHEET_HEADERS)}"
         )
     header = rows[0]
-    season_col = _rules_col_index(header, "시즌")
-    if season_col < 0:
-        season_col = 0
-    available: list[str] = []
-    for row in rows[1:]:
-        sid = row[season_col].strip() if len(row) > season_col else ""
-        if not sid:
-            continue
-        available.append(sid)
-        if sid == season_id:
-            return _row_to_rules_dict(header, row, season_id)
-    raise ValueError(
-        f"'{RULES_SHEET_NAME}' 시트에 시즌 '{season_id}' 행이 없습니다.\n"
-        f"등록된 시즌: {', '.join(available) if available else '(없음)'}"
-    )
+    data_row = next((row for row in rows[1:] if any(c.strip() for c in row)), None)
+    if data_row is None:
+        raise ValueError(f"'{RULES_SHEET_NAME}' 시트 2행에 규칙 값을 입력해 주세요.")
+    rules = _row_to_rules_dict(header, data_row)
+    if settlement_season and settlement_season.strip():
+        rules["settlement_season"] = settlement_season.strip()
+    return rules
+
+
+def load_rules_for_season(season_id: str) -> dict:
+    """하위 호환. 규칙은 시트 2행 단일, season_id는 정산 시즌(스냅샷)용."""
+    return load_rules(settlement_season=season_id)
 
 
 def rules_to_legacy_rules(rules: dict) -> dict[str, list[int]]:
@@ -695,7 +892,10 @@ def rules_to_legacy_rules(rules: dict) -> dict[str, list[int]]:
 def print_rules_preview(rules: dict) -> None:
     b = rules["bosses"]
     print("\n" + "=" * 42)
-    print(f"[적용 규칙] 시즌 {rules['season']}")
+    if rules.get("settlement_season"):
+        print(f"[적용 규칙] 공통 (정산 시즌 {rules['settlement_season']})")
+    else:
+        print("[적용 규칙] 공통")
     print("=" * 42)
     print(f"  용(드래곤): rate {b['dragon']['rate']}%, allow {b['dragon']['allow']}")
     print(f"  기(기계신): rate {b['machine']['rate']}%, allow {b['machine']['allow']}")
@@ -712,12 +912,12 @@ def print_rules_preview(rules: dict) -> None:
 
 def rules_snapshot_rows(rules: dict) -> list[list[str]]:
     """시즌 시트 상단에 붙일 규칙 스냅샷 행."""
-    return [
-        ["=== 적용 규칙 (정산 시점 스냅샷) ===", ""],
-        ["시즌", rules["season"]],
-        ["JSON", json.dumps(rules, ensure_ascii=False)],
-        [""],
-    ]
+    rows = [["=== 적용 규칙 (정산 시점 스냅샷) ===", ""]]
+    if rules.get("settlement_season"):
+        rows.append(["정산 시즌", rules["settlement_season"]])
+    rows.append(["JSON", json.dumps(rules, ensure_ascii=False)])
+    rows.append([""])
+    return rows
 
 
 def load_settings() -> dict:
