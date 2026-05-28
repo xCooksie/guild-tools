@@ -398,7 +398,7 @@ def parse_kv_input(text: str) -> list[tuple[str, str]]:
     if not text.strip():
         return []
     out = []
-    for item in re.split(r"\s+", text.strip()):
+    for item in re.split(r"[\s,]+", text.strip()):
         if ":" in item:
             sub, main = item.split(":", 1)
             out.append((main.strip(), sub.strip()))
@@ -781,7 +781,7 @@ def sync_kv(ws, input_text: str, sub_col: int, main_col: int) -> None:
 
 
 def sync_not_received(ws, input_text: str) -> None:
-    names = [n.strip() for n in re.split(r"\s+", input_text.strip()) if n.strip()]
+    names = [n.strip() for n in re.split(r"[\s,]+", input_text.strip()) if n.strip()]
     if not names:
         return
     existing = set(ws.col_values(5)[1:])
