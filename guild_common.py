@@ -11,6 +11,10 @@ from googleapiclient.discovery import build
 
 warnings.filterwarnings("ignore", module="google_auth_httplib2")
 
+# ---------------------------------------------------------------------------
+# 전역 상수
+# ---------------------------------------------------------------------------
+
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1vbJOCrOp_NGBKnY5uQHgRUzxiHPi_BaNxkDiHr0W16I/edit"
 READABLE_DOC_ID = "16MIqR6XZp9y0S_qoChHSRd0N5qMKdwoRG28w4YhsusU"
 KST = timezone(timedelta(hours=9))
@@ -18,9 +22,16 @@ KST = timezone(timedelta(hours=9))
 APPLY_LOG_SHEET_NAME = "반영로그"
 APPLY_LOG_HEADERS = ["No", "시각", "제목", "JSON", "상점현황_JSON", "실행취소"]
 
+LOG_KIND_POINTS = "points"
+LOG_KIND_RENAME = "rename"
+
 _docs_service = None
 _creds = None
 
+
+# ---------------------------------------------------------------------------
+# 데이터 클래스
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ApplyResult:
@@ -56,52 +67,9 @@ class ApplyResult:
         self.warnings.extend(log_result.warnings)
 
 
-def print_apply_summary(result: ApplyResult) -> None:
-    """반영 결과를 단계별로 출력한다."""
-    def _status(ok: bool) -> str:
-        return "✅ 성공" if ok else "❌ 실패"
-
-    print("\n" + "=" * 42)
-    print("반영 결과 요약")
-    print("=" * 42)
-    if result.tool:
-        print(f"도구     : {result.tool}")
-    if result.timestamp:
-        print(f"시각     : {result.timestamp}")
-    if result.member_count:
-        print(f"대상     : {result.member_count}명")
-    print(f"[상점현황 시트] {_status(result.sheet_ok)}")
-    if result.sheet_error:
-        print(f"  └ {result.sheet_error}")
-    if result.sheet_ok:
-        if result.machine_log_ok and result.machine_log_no:
-            print(f"[반영로그]    {_status(True)} → No. {result.machine_log_no} (실행취소용)")
-        else:
-            print(f"[반영로그]    {_status(False)}")
-            if result.machine_log_error:
-                print(f"  └ {result.machine_log_error}")
-        if result.machine_log_ok:
-            print(f"[상점 반영기록]   {_status(result.readable_log_ok)}")
-            if result.readable_log_error:
-                print(f"  └ {result.readable_log_error}")
-        else:
-            print("[상점 반영기록]   ⏭️ 건너뜀 (반영로그 없음)")
-    for w in result.warnings:
-        print(f"⚠️ {w}")
-    print("-" * 42)
-    if result.is_full_success:
-        print("전체 상태: ✅ 완료 (시트 + 로그 모두 반영)")
-    elif result.is_dangerous:
-        print("전체 상태: ⚠️ 부분 성공 (위험)")
-        print("  점수는 시트에 반영되었으나 반영로그 기록이 없습니다.")
-        print("  → 실행취소 도구로 복구할 수 없습니다. 수동 조정이 필요합니다.")
-    elif not result.sheet_ok:
-        print("전체 상태: ❌ 시트 반영 실패")
-    else:
-        print("전체 상태: ⚠️ 부분 성공")
-        print("  → 상점 반영기록만 실패한 경우, 반영로그 No.로 실행취소는 가능합니다.")
-    print("=" * 42 + "\n")
-
+# ---------------------------------------------------------------------------
+# 인증 / 세션 초기화
+# ---------------------------------------------------------------------------
 
 def require_common():
     if "ensure_gspread" not in globals():
@@ -124,16 +92,6 @@ def init_session():
     return ensure_gspread()
 
 
-def _extract_full_text(document: dict) -> str:
-    return "".join(
-        el["textRun"]["content"]
-        for block in document["body"]["content"]
-        if "paragraph" in block
-        for el in block["paragraph"]["elements"]
-        if "textRun" in el
-    )
-
-
 def _get_docs_service():
     global _docs_service, _creds
     if _creds is None:
@@ -143,6 +101,47 @@ def _get_docs_service():
     return _docs_service
 
 
+# ---------------------------------------------------------------------------
+# 유틸리티 — 문자열 / 숫자 파싱
+# ---------------------------------------------------------------------------
+
+def col_letter(zero_based_idx: int) -> str:
+    return chr(65 + zero_based_idx)
+
+
+def split_input_tokens(text: str) -> list[str]:
+    return [t for t in re.split(r"[\s,]+", text.strip()) if t]
+
+
+def parse_kv_input(text: str) -> list[tuple[str, str]]:
+    if not text.strip():
+        return []
+    out = []
+    for item in re.split(r"[\s,]+", text.strip()):
+        if ":" in item:
+            sub, main = item.split(":", 1)
+            out.append((main.strip(), sub.strip()))
+    return out
+
+
+def parse_optional_float(raw) -> float | None:
+    s = str(raw).strip()
+    if not s or s.lower() in ("nan", "none", "#n/a"):
+        return None
+    try:
+        return float(s.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _parse_num(raw: str, as_float: bool = False):
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    clean = raw.replace(",", "")
+    return float(clean) if as_float else int(float(clean))
+
+
 def _parse_log_no_cell(val) -> int | None:
     try:
         return int(float(str(val).strip()))
@@ -150,19 +149,468 @@ def _parse_log_no_cell(val) -> int | None:
         return None
 
 
-def get_or_create_log_index_sheet():
-    return get_or_create_worksheet(sh, APPLY_LOG_SHEET_NAME, APPLY_LOG_HEADERS)
+# ---------------------------------------------------------------------------
+# 유틸리티 — 점수 포맷 / 파싱
+# ---------------------------------------------------------------------------
+
+def parse_score_from_cell(raw_val: str) -> float:
+    match = re.search(r"([\+\-\[\]0-9.]+)", raw_val)
+    if not match:
+        return 0.0
+    clean = re.sub(r"[^0-9.+-]", "", match.group(1))
+    try:
+        return float(clean) if clean else 0.0
+    except ValueError:
+        return 0.0
 
 
-def allocate_next_log_no(ws=None) -> int:
-    """`반영로그` 시트 A열 기준 다음 No."""
-    if ws is None:
-        ws = get_or_create_log_index_sheet()
-    col = ws.col_values(1)
-    nums = [_parse_log_no_cell(v) for v in col[1:]]
-    nums = [n for n in nums if n is not None]
-    return max(nums) + 1 if nums else 1
+def format_score(value: float) -> str:
+    if value == int(value):
+        return f"+{int(value)}" if value > 0 else str(int(value))
+    return f"[{value:+}]"
 
+
+format_point = format_score
+
+
+def sort_key_by_score(row: list) -> float:
+    return parse_score_from_cell(row[1]) if len(row) >= 2 else -999999.0
+
+
+def apply_delta_to_row(row: list, delta: float) -> tuple[float, float]:
+    raw = row[1] if len(row) > 1 else "0"
+    match = re.search(r"([\+\-\[\]0-9.]+)", raw)
+    suffix = raw.replace(match.group(1), "", 1) if match else ""
+    cur = parse_score_from_cell(raw)
+    new = round(cur + delta, 2)
+    row[1] = format_score(new) + suffix
+    return cur, new
+
+
+# ---------------------------------------------------------------------------
+# 유틸리티 — 상점현황 텍스트 파싱
+# ---------------------------------------------------------------------------
+
+def parse_store_text(text: str) -> list[list[str]]:
+    restored = re.sub(r"\s*ㆍ", "\nㆍ", text).strip()
+    result = []
+    for line in restored.split("\n"):
+        name = line.replace("ㆍ", "").strip()
+        if not name:
+            continue
+        if ":" in name:
+            n, v = name.split(":", 1)
+            result.append([n.strip(), v.strip()])
+        else:
+            result.append([name, ""])
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Google Sheets — 워크시트 공통
+# ---------------------------------------------------------------------------
+
+def get_or_create_worksheet(spreadsheet, title: str, headers: list | None = None):
+    try:
+        return spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        ncol = max(len(headers), 6) if headers else 6
+        ws = spreadsheet.add_worksheet(title=title, rows="1000", cols=str(ncol))
+        if headers:
+            end = col_letter(len(headers) - 1)
+            ws.update(range_name=f"A1:{end}1", values=[headers])
+        return ws
+
+
+def sync_kv(ws, input_text: str, sub_col: int, main_col: int) -> None:
+    pairs = parse_kv_input(input_text)
+    if not pairs:
+        return
+    current = ws.get_all_values()
+    key_map = {
+        row[main_col]: i + 1
+        for i, row in enumerate(current)
+        if len(row) > main_col and row[main_col].strip()
+    }
+    for main, sub in pairs:
+        if main in key_map:
+            ws.update(range_name=f"{col_letter(sub_col)}{key_map[main]}", values=[[sub]])
+        else:
+            next_row = len(ws.col_values(main_col + 1)) + 1
+            left_col = col_letter(min(sub_col, main_col))
+            right_col = col_letter(max(sub_col, main_col))
+            row_vals = [sub, main] if sub_col < main_col else [main, sub]
+            ws.update(range_name=f"{left_col}{next_row}:{right_col}{next_row}", values=[row_vals])
+            key_map[main] = next_row
+
+
+def sync_not_received(ws, input_text: str) -> None:
+    names = [n.strip() for n in re.split(r"[\s,]+", input_text.strip()) if n.strip()]
+    if not names:
+        return
+    existing = set(ws.col_values(5)[1:])
+    to_add = [[n] for n in names if n not in existing]
+    if to_add:
+        next_row = len(ws.col_values(5)) + 1
+        ws.update(range_name=f"E{next_row}", values=to_add)
+
+
+# ---------------------------------------------------------------------------
+# 별명/다계정 매핑 시트
+# ---------------------------------------------------------------------------
+
+def load_alias_maps(map_data=None):
+    if map_data is None:
+        map_data = sh.worksheet("별명/다계정").get_all_values()
+    alias_to_real = {row[2].strip(): row[3].strip() for row in map_data[1:] if len(row) > 3 and row[2].strip()}
+    real_to_sheet = {row[1].strip(): row[0].strip() for row in map_data[1:] if len(row) > 1 and row[1].strip()}
+    real_to_alias = {
+        row[1].strip(): row[0].strip()
+        for row in map_data[1:]
+        if len(row) > 1 and row[1].strip() and row[0].strip() and row[0].strip() != row[1].strip()
+    }
+    sub_to_main = alias_to_real.copy()
+    return alias_to_real, real_to_sheet, real_to_alias, sub_to_main
+
+
+def load_mapping_sheet():
+    ws = sh.worksheet("별명/다계정")
+    return ws, ws.get_all_values()
+
+
+def get_not_received(map_data: list) -> set[str]:
+    return {row[4].strip() for row in map_data[1:] if len(row) > 4 and row[4].strip()}
+
+
+def resolve_member(input_name: str, alias_to_real: dict, real_to_sheet: dict) -> tuple[str, str]:
+    real = alias_to_real.get(input_name, input_name)
+    target = real_to_sheet.get(real, real)
+    return target, real
+
+
+def resolve_store_display_name(
+    nick: str,
+    map_data: list,
+    name_idx: dict,
+    real_to_sheet: dict | None = None,
+) -> str:
+    """입력 닉 → 상점현황 A열에 쓰이는 표시명."""
+    nick = nick.strip()
+    if not nick:
+        return nick
+    if nick in name_idx:
+        return nick
+    if real_to_sheet is None:
+        _, real_to_sheet, _, _ = load_alias_maps(map_data)
+    if nick in real_to_sheet:
+        return real_to_sheet[nick]
+    for row in map_data[1:]:
+        if not row:
+            continue
+        if row[0].strip() == nick and nick in name_idx:
+            return nick
+        if len(row) > 1 and row[1].strip() == nick:
+            return real_to_sheet.get(nick, row[0].strip() or nick)
+    return nick
+
+
+# ---------------------------------------------------------------------------
+# 상점현황 시트 — 로드 / 저장
+# ---------------------------------------------------------------------------
+
+def load_store_sheet(title: str = "상점현황"):
+    ws = sh.worksheet(title)
+    data = ws.get_all_values()
+    rows = [list(r) for r in data if any(c.strip() for c in r)]
+    name_idx = {row[0].strip(): i for i, row in enumerate(rows) if row}
+    return ws, rows, name_idx
+
+
+def save_store_sheet(ws, rows: list) -> str | None:
+    """상점현황 시트 저장. 실패 시 오류 메시지, 성공 시 None."""
+    try:
+        rows.sort(key=sort_key_by_score, reverse=True)
+        ws.clear()
+        ws.update(rows, range_name="A1")
+        return None
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------------------
+# 상점현황 — 컨텍스트 기반 반영 (open / apply / finalize)
+# ---------------------------------------------------------------------------
+
+def open_store_context():
+    ws_mapping, map_data = load_mapping_sheet()
+    alias_to_real, real_to_sheet, _, _ = load_alias_maps(map_data)
+    ws_store, rows, name_idx = load_store_sheet()
+    return {
+        "ws_mapping": ws_mapping,
+        "map_data": map_data,
+        "alias_to_real": alias_to_real,
+        "real_to_sheet": real_to_sheet,
+        "ws_store": ws_store,
+        "rows": rows,
+        "name_idx": name_idx,
+        "results_log": [],
+        "log_for_doc": {},
+        "cancelled": False,
+    }
+
+
+def store_apply_delta(
+    ctx: dict,
+    input_name: str,
+    delta: float,
+    log_detail: str,
+    *,
+    allow_cancel: bool = True,
+    skip_if_missing: bool = False,
+    new_row_formatter=None,
+) -> str | None:
+    """상점현황에 delta만큼 반영. target_name 반환, 취소 시 None."""
+    if ctx["cancelled"]:
+        return None
+    target, _ = resolve_member(input_name, ctx["alias_to_real"], ctx["real_to_sheet"])
+    ctx["log_for_doc"][target] = ctx["log_for_doc"].get(target, 0) + delta
+
+    if target in ctx["name_idx"]:
+        row = ctx["rows"][ctx["name_idx"][target]]
+        cur, new = apply_delta_to_row(row, delta)
+        ctx["results_log"].append(f"✅ {target}: {cur} → {new} ({log_detail})")
+        return target
+
+    if skip_if_missing:
+        print(f"[알림] '{target}'님을 상점현황에서 찾을 수 없어 건너뜁니다.")
+        return target
+
+    opts = "(예/아니요/취소)" if allow_cancel else "(예/아니요)"
+    ans = input(f"'({target})' 상점목록에 없습니다. 추가할까요? {opts}: ").strip()
+    if ans == "예":
+        val = new_row_formatter(delta) if new_row_formatter else format_score(delta)
+        ctx["rows"].append([target, val])
+        ctx["name_idx"][target] = len(ctx["rows"]) - 1
+        ctx["results_log"].append(f"✅ {target}: (신규) → {val}")
+    elif ans == "취소" and allow_cancel:
+        ctx["cancelled"] = True
+    return target
+
+
+def store_finalize(ctx: dict, title: str, timestamp: str, *, banner: str | None = None) -> ApplyResult | None:
+    if ctx["cancelled"] or not ctx["results_log"]:
+        return None
+    display = banner or title
+    result = ApplyResult(tool=display, timestamp=timestamp, member_count=len(ctx["log_for_doc"]))
+
+    print(f"\n[{display}] 변경 내역 ({len(ctx['results_log'])}건)")
+    for line in ctx["results_log"]:
+        print(line)
+
+    sheet_err = save_store_sheet(ctx["ws_store"], ctx["rows"])
+    if sheet_err:
+        result.sheet_error = sheet_err
+    else:
+        result.sheet_ok = True
+
+    if result.sheet_ok:
+        log_result = write_dual_log(
+            title, ctx["log_for_doc"], ctx["results_log"], timestamp,
+            store_rows=ctx["rows"],
+        )
+        result.merge_log(log_result)
+    else:
+        result.warnings.append("시트 저장 실패로 로그 기록을 건너뜀")
+
+    print_apply_summary(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 상점현황 — 일괄 반영 (메인 정산)
+# ---------------------------------------------------------------------------
+
+def apply_calc_points_to_store(
+    calc_points: dict,
+    map_data: list,
+    ws_mapping,
+    timestamp: str,
+    season_label: str,
+    details_sort_helper: dict | None = None,
+) -> ApplyResult | None:
+    """메인 정산: 계산된 상벌점을 상점현황에 일괄 반영."""
+    alias_to_real, real_to_sheet, _, _ = load_alias_maps(map_data)
+    not_received = get_not_received(map_data)
+    ws_store, rows, name_idx = load_store_sheet()
+    log_for_doc: dict[str, float] = {}
+    results_log: list[str] = []
+    cancelled = False
+
+    for guild_member, point in calc_points.items():
+        target, real = resolve_member(guild_member, alias_to_real, real_to_sheet)
+        display = f"{real}({target})" if target != real else real
+        if target in not_received:
+            continue
+        log_for_doc[target] = log_for_doc.get(target, 0) + point
+
+        if target in name_idx:
+            row = rows[name_idx[target]]
+            cur, new = apply_delta_to_row(row, point)
+            results_log.append(f"✅ {display}: {cur} → {new} ({point:+})")
+        else:
+            while True:
+                ans = input(f"'({target})'은 상점 목록에 없습니다. 추가할까요? (예/아니요/취소): ").strip()
+                if ans == "예":
+                    rows.append([target, format_point(point)])
+                    results_log.append(f"✅ {display}: (신규) → {format_point(point)}")
+                    break
+                if ans == "아니요":
+                    nr_col = ws_mapping.col_values(5)
+                    ws_mapping.update(values=[[target]], range_name=f"E{len(nr_col) + 1}")
+                    break
+                if ans == "취소":
+                    cancelled = True
+                    break
+                print("[알림] '예', '아니요' 또는 '취소'로 입력해주세요.")
+            if cancelled:
+                break
+
+    if cancelled:
+        return None
+
+    log_title = f"{season_label} 시즌 상벌점 반영"
+    result = ApplyResult(
+        tool=log_title,
+        timestamp=timestamp,
+        member_count=len(log_for_doc),
+    )
+
+    print(f"\n[{log_title}] 변경 내역 ({len(results_log)}건)")
+    for line in results_log:
+        print(line)
+
+    sheet_err = save_store_sheet(ws_store, rows)
+    if sheet_err:
+        result.sheet_error = sheet_err
+    else:
+        result.sheet_ok = True
+
+    if result.sheet_ok:
+        log_result = write_dual_log(
+            log_title,
+            log_for_doc,
+            results_log,
+            timestamp,
+            details_sort_helper=details_sort_helper,
+            store_rows=rows,
+        )
+        result.merge_log(log_result)
+    else:
+        result.warnings.append("시트 저장 실패로 로그 기록을 건너뜀")
+
+    print_apply_summary(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 닉네임 변경
+# ---------------------------------------------------------------------------
+
+def _nick_matches_cell(cell_val: str, old_input: str, old_store: str) -> bool:
+    cell = cell_val.strip()
+    return cell in (old_input, old_store)
+
+
+def _apply_rename_on_sheets(
+    ws_mapping,
+    map_data: list,
+    ws_store,
+    store_rows: list,
+    old_input: str,
+    new_store: str,
+    name_idx: dict,
+    real_to_sheet: dict,
+) -> tuple[bool, str, str]:
+    """시트에서 old를 찾아 new_store로 변경. (found, old_store_key, new_store)."""
+    old_store = resolve_store_display_name(old_input, map_data, name_idx, real_to_sheet)
+    new_store = new_store.strip()
+    found = False
+
+    for i, row in enumerate(map_data):
+        if len(row) > 1 and _nick_matches_cell(row[1], old_input, old_store):
+            ws_mapping.update_cell(i + 1, 2, new_store)
+            found = True
+        if len(row) > 3 and _nick_matches_cell(row[3], old_input, old_store):
+            ws_mapping.update_cell(i + 1, 4, new_store)
+            found = True
+
+    for i, row in enumerate(store_rows):
+        if row and _nick_matches_cell(row[0], old_input, old_store):
+            ws_store.update_cell(i + 1, 1, new_store)
+            found = True
+
+    if found:
+        return True, old_store, new_store
+    return False, old_store, new_store
+
+
+def apply_nickname_changes(
+    pairs: list[tuple[str, str]],
+    timestamp: str | None = None,
+) -> ApplyResult | None:
+    """닉네임 변경 + 반영로그(상점 표시명 기준). pairs: (전닉, 현닉)."""
+    if not pairs:
+        print("[알림] 변경 내역을 입력해주세요.")
+        return None
+
+    ts = timestamp or datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    results_log = []
+    log_changes = {}
+
+    for old_input, new_input in pairs:
+        old_input = old_input.strip()
+        new_input = new_input.strip()
+        if not old_input or not new_input:
+            continue
+        ws_mapping, map_data = load_mapping_sheet()
+        ws_store, store_rows, name_idx = load_store_sheet()
+        _, real_to_sheet, _, _ = load_alias_maps(map_data)
+        found, old_store, new_store = _apply_rename_on_sheets(
+            ws_mapping, map_data, ws_store, store_rows,
+            old_input, new_input, name_idx, real_to_sheet,
+        )
+        if found:
+            log_changes[old_store] = new_store
+            results_log.append(f"🏷️ {old_store} → {new_store}")
+        else:
+            print(f"[경고] '{old_input}'님을 시트에서 찾을 수 없습니다.")
+
+    if not results_log:
+        return None
+
+    print(f"\n[닉네임 변경] 변경 내역 ({len(results_log)}건)")
+    for line in results_log:
+        print(line)
+
+    _, store_rows_snap, _ = load_store_sheet()
+    result = ApplyResult(tool="닉네임 변경", timestamp=ts, member_count=len(log_changes))
+    result.sheet_ok = True
+    log_result = write_dual_log(
+        "닉네임 변경",
+        log_changes,
+        results_log,
+        ts,
+        store_rows=store_rows_snap,
+        log_kind=LOG_KIND_RENAME,
+    )
+    result.merge_log(log_result)
+    print_apply_summary(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 반영로그 — 스냅샷 인코딩/디코딩
+# ---------------------------------------------------------------------------
 
 def encode_store_snapshot(rows: list) -> str:
     """상점현황 전체를 JSON 문자열로 (반영 직후 스냅샷)."""
@@ -181,16 +629,16 @@ def decode_store_snapshot(raw: str) -> list[list[str]]:
     return [[str(c) for c in row] for row in data]
 
 
-LOG_KIND_POINTS = "points"
-LOG_KIND_RENAME = "rename"
+# ---------------------------------------------------------------------------
+# 반영로그 — 로그 엔트리 직렬화 / 파싱
+# ---------------------------------------------------------------------------
+
+def _is_log_numeric(val) -> bool:
+    return isinstance(val, (int, float)) and not isinstance(val, bool)
 
 
 def pack_log_entry(kind: str, changes: dict) -> dict:
     return {"kind": kind, "changes": changes}
-
-
-def _is_log_numeric(val) -> bool:
-    return isinstance(val, (int, float)) and not isinstance(val, bool)
 
 
 def parse_log_entry(raw: dict | None) -> dict | None:
@@ -220,9 +668,27 @@ def infer_log_kind(changes: dict) -> str:
     return parsed["kind"] if parsed else LOG_KIND_POINTS
 
 
+# ---------------------------------------------------------------------------
+# 반영로그 시트 — CRUD
+# ---------------------------------------------------------------------------
+
+def get_or_create_log_index_sheet():
+    return get_or_create_worksheet(sh, APPLY_LOG_SHEET_NAME, APPLY_LOG_HEADERS)
+
+
 def _log_undo_col_1based(row: list) -> int:
     """실행취소 열 (1-based). 신규 6열=6, 구형 5열=5."""
     return 6 if len(row) >= 6 else 5
+
+
+def allocate_next_log_no(ws=None) -> int:
+    """`반영로그` 시트 A열 기준 다음 No."""
+    if ws is None:
+        ws = get_or_create_log_index_sheet()
+    col = ws.col_values(1)
+    nums = [_parse_log_no_cell(v) for v in col[1:]]
+    nums = [n for n in nums if n is not None]
+    return max(nums) + 1 if nums else 1
 
 
 def append_log_index_row(
@@ -311,6 +777,11 @@ def get_log_from_index(target_no: int) -> dict | None:
     return changes if isinstance(changes, dict) else None
 
 
+def get_log_by_no(target_no: int) -> dict | None:
+    """실행취소용 JSON. `반영로그` 시트에서만 조회."""
+    return get_log_from_index(target_no)
+
+
 def list_log_entries(*, after_no: int = 0, include_undone: bool = False) -> list[dict]:
     """반영로그 목록 (No. 오름차순). after_no 초과만."""
     try:
@@ -348,6 +819,28 @@ def list_log_entries(*, after_no: int = 0, include_undone: bool = False) -> list
         return []
 
 
+def is_log_already_undone(target_no: int) -> bool:
+    meta = get_log_index_meta(target_no)
+    return bool(meta and meta["undone"])
+
+
+def mark_log_undone(target_no: int) -> str | None:
+    """반영로그 시트에 실행취소 표시."""
+    try:
+        entry = get_log_index_entry(target_no)
+        if entry is None:
+            return None
+        ws = get_or_create_log_index_sheet()
+        ws.update_cell(entry["row"], entry.get("undo_col", 6), "Y")
+        return None
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------------------
+# 반영로그 — 닉변 체인 추적
+# ---------------------------------------------------------------------------
+
 def build_rename_chain(entries: list[dict]) -> list[tuple[str, str]]:
     chain = []
     for entry in entries:
@@ -369,23 +862,9 @@ def forward_rename(name: str, chain: list[tuple[str, str]]) -> str:
     return current
 
 
-def is_log_already_undone(target_no: int) -> bool:
-    meta = get_log_index_meta(target_no)
-    return bool(meta and meta["undone"])
-
-
-def mark_log_undone(target_no: int) -> str | None:
-    """반영로그 시트에 실행취소 표시."""
-    try:
-        entry = get_log_index_entry(target_no)
-        if entry is None:
-            return None
-        ws = get_or_create_log_index_sheet()
-        ws.update_cell(entry["row"], entry.get("undo_col", 6), "Y")
-        return None
-    except Exception as e:
-        return f"{type(e).__name__}: {e}"
-
+# ---------------------------------------------------------------------------
+# 반영로그 — 저장 (머신로그 + 사람이 읽는 Docs 로그)
+# ---------------------------------------------------------------------------
 
 def append_machine_log(
     title_text: str,
@@ -416,6 +895,16 @@ def append_machine_log(
         return next_no, None
     except Exception as e:
         return -1, f"{type(e).__name__}: {e}"
+
+
+def _extract_full_text(document: dict) -> str:
+    return "".join(
+        el["textRun"]["content"]
+        for block in document["body"]["content"]
+        if "paragraph" in block
+        for el in block["paragraph"]["elements"]
+        if "textRun" in el
+    )
 
 
 def append_readable_log_to_doc(
@@ -458,191 +947,6 @@ def append_readable_log_to_doc(
         return f"{type(e).__name__}: {e}"
 
 
-def parse_score_from_cell(raw_val: str) -> float:
-    match = re.search(r"([\+\-\[\]0-9.]+)", raw_val)
-    if not match:
-        return 0.0
-    clean = re.sub(r"[^0-9.+-]", "", match.group(1))
-    try:
-        return float(clean) if clean else 0.0
-    except ValueError:
-        return 0.0
-
-
-def format_score(value: float) -> str:
-    if value == int(value):
-        return f"+{int(value)}" if value > 0 else str(int(value))
-    return f"[{value:+}]"
-
-
-format_point = format_score
-
-
-def sort_key_by_score(row: list) -> float:
-    return parse_score_from_cell(row[1]) if len(row) >= 2 else -999999.0
-
-
-def parse_store_text(text: str) -> list[list[str]]:
-    restored = re.sub(r"\s*ㆍ", "\nㆍ", text).strip()
-    result = []
-    for line in restored.split("\n"):
-        name = line.replace("ㆍ", "").strip()
-        if not name:
-            continue
-        if ":" in name:
-            n, v = name.split(":", 1)
-            result.append([n.strip(), v.strip()])
-        else:
-            result.append([name, ""])
-    return result
-
-
-def parse_kv_input(text: str) -> list[tuple[str, str]]:
-    if not text.strip():
-        return []
-    out = []
-    for item in re.split(r"[\s,]+", text.strip()):
-        if ":" in item:
-            sub, main = item.split(":", 1)
-            out.append((main.strip(), sub.strip()))
-    return out
-
-
-def col_letter(zero_based_idx: int) -> str:
-    return chr(65 + zero_based_idx)
-
-
-def get_log_by_no(target_no: int) -> dict | None:
-    """실행취소용 JSON. `반영로그` 시트에서만 조회."""
-    return get_log_from_index(target_no)
-
-
-def load_alias_maps(map_data=None):
-    if map_data is None:
-        map_data = sh.worksheet("별명/다계정").get_all_values()
-    alias_to_real = {row[2].strip(): row[3].strip() for row in map_data[1:] if len(row) > 3 and row[2].strip()}
-    real_to_sheet = {row[1].strip(): row[0].strip() for row in map_data[1:] if len(row) > 1 and row[1].strip()}
-    real_to_alias = {
-        row[1].strip(): row[0].strip()
-        for row in map_data[1:]
-        if len(row) > 1 and row[1].strip() and row[0].strip() and row[0].strip() != row[1].strip()
-    }
-    sub_to_main = alias_to_real.copy()
-    return alias_to_real, real_to_sheet, real_to_alias, sub_to_main
-
-
-def load_mapping_sheet():
-    ws = sh.worksheet("별명/다계정")
-    return ws, ws.get_all_values()
-
-
-def get_not_received(map_data: list) -> set[str]:
-    return {row[4].strip() for row in map_data[1:] if len(row) > 4 and row[4].strip()}
-
-
-def resolve_member(input_name: str, alias_to_real: dict, real_to_sheet: dict) -> tuple[str, str]:
-    real = alias_to_real.get(input_name, input_name)
-    target = real_to_sheet.get(real, real)
-    return target, real
-
-
-def resolve_store_display_name(
-    nick: str,
-    map_data: list,
-    name_idx: dict,
-    real_to_sheet: dict | None = None,
-) -> str:
-    """입력 닉 → 상점현황 A열에 쓰이는 표시명."""
-    nick = nick.strip()
-    if not nick:
-        return nick
-    if nick in name_idx:
-        return nick
-    if real_to_sheet is None:
-        _, real_to_sheet, _, _ = load_alias_maps(map_data)
-    if nick in real_to_sheet:
-        return real_to_sheet[nick]
-    for row in map_data[1:]:
-        if not row:
-            continue
-        if row[0].strip() == nick and nick in name_idx:
-            return nick
-        if len(row) > 1 and row[1].strip() == nick:
-            return real_to_sheet.get(nick, row[0].strip() or nick)
-    return nick
-
-
-def _nick_matches_cell(cell_val: str, old_input: str, old_store: str) -> bool:
-    cell = cell_val.strip()
-    return cell in (old_input, old_store)
-
-
-def _apply_rename_on_sheets(
-    ws_mapping,
-    map_data: list,
-    ws_store,
-    store_rows: list,
-    old_input: str,
-    new_store: str,
-    name_idx: dict,
-    real_to_sheet: dict,
-) -> tuple[bool, str, str]:
-    """시트에서 old를 찾아 new_store로 변경. (found, old_store_key, new_store)."""
-    old_store = resolve_store_display_name(old_input, map_data, name_idx, real_to_sheet)
-    new_store = new_store.strip()
-    found = False
-
-    for i, row in enumerate(map_data):
-        if len(row) > 1 and _nick_matches_cell(row[1], old_input, old_store):
-            ws_mapping.update_cell(i + 1, 2, new_store)
-            found = True
-        if len(row) > 3 and _nick_matches_cell(row[3], old_input, old_store):
-            ws_mapping.update_cell(i + 1, 4, new_store)
-            found = True
-
-    for i, row in enumerate(store_rows):
-        if row and _nick_matches_cell(row[0], old_input, old_store):
-            ws_store.update_cell(i + 1, 1, new_store)
-            found = True
-
-    if found:
-        return True, old_store, new_store
-    return False, old_store, new_store
-
-
-def load_store_sheet(title: str = "상점현황"):
-    ws = sh.worksheet(title)
-    data = ws.get_all_values()
-    rows = [list(r) for r in data if any(c.strip() for c in r)]
-    name_idx = {row[0].strip(): i for i, row in enumerate(rows) if row}
-    return ws, rows, name_idx
-
-
-def save_store_sheet(ws, rows: list) -> str | None:
-    """상점현황 시트 저장. 실패 시 오류 메시지, 성공 시 None."""
-    try:
-        rows.sort(key=sort_key_by_score, reverse=True)
-        ws.clear()
-        ws.update(rows, range_name="A1")
-        return None
-    except Exception as e:
-        return f"{type(e).__name__}: {e}"
-
-
-def apply_delta_to_row(row: list, delta: float) -> tuple[float, float]:
-    raw = row[1] if len(row) > 1 else "0"
-    match = re.search(r"([\+\-\[\]0-9.]+)", raw)
-    suffix = raw.replace(match.group(1), "", 1) if match else ""
-    cur = parse_score_from_cell(raw)
-    new = round(cur + delta, 2)
-    row[1] = format_score(new) + suffix
-    return cur, new
-
-
-def split_input_tokens(text: str) -> list[str]:
-    return [t for t in re.split(r"[\s,]+", text.strip()) if t]
-
-
 def write_dual_log(
     title: str,
     log_dict: dict,
@@ -677,6 +981,10 @@ def write_dual_log(
         result.readable_log_error = "반영로그 실패로 상점 반영기록을 건너뜀"
     return result
 
+
+# ---------------------------------------------------------------------------
+# 실행취소
+# ---------------------------------------------------------------------------
 
 def restore_store_from_backup(log_no: int) -> ApplyResult:
     """반영로그 No.의 상점현황_JSON으로 상점현황 시트 전체 복원."""
@@ -821,60 +1129,6 @@ def undo_rename_log(log_no: int, parsed: dict | None = None) -> ApplyResult | No
     return result
 
 
-def apply_nickname_changes(
-    pairs: list[tuple[str, str]],
-    timestamp: str | None = None,
-) -> ApplyResult | None:
-    """닉네임 변경 + 반영로그(상점 표시명 기준). pairs: (전닉, 현닉)."""
-    if not pairs:
-        print("[알림] 변경 내역을 입력해주세요.")
-        return None
-
-    ts = timestamp or datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-    results_log = []
-    log_changes = {}
-
-    for old_input, new_input in pairs:
-        old_input = old_input.strip()
-        new_input = new_input.strip()
-        if not old_input or not new_input:
-            continue
-        ws_mapping, map_data = load_mapping_sheet()
-        ws_store, store_rows, name_idx = load_store_sheet()
-        _, real_to_sheet, _, _ = load_alias_maps(map_data)
-        found, old_store, new_store = _apply_rename_on_sheets(
-            ws_mapping, map_data, ws_store, store_rows,
-            old_input, new_input, name_idx, real_to_sheet,
-        )
-        if found:
-            log_changes[old_store] = new_store
-            results_log.append(f"🏷️ {old_store} → {new_store}")
-        else:
-            print(f"[경고] '{old_input}'님을 시트에서 찾을 수 없습니다.")
-
-    if not results_log:
-        return None
-
-    print(f"\n[닉네임 변경] 변경 내역 ({len(results_log)}건)")
-    for line in results_log:
-        print(line)
-
-    _, store_rows_snap, _ = load_store_sheet()
-    result = ApplyResult(tool="닉네임 변경", timestamp=ts, member_count=len(log_changes))
-    result.sheet_ok = True
-    log_result = write_dual_log(
-        "닉네임 변경",
-        log_changes,
-        results_log,
-        ts,
-        store_rows=store_rows_snap,
-        log_kind=LOG_KIND_RENAME,
-    )
-    result.merge_log(log_result)
-    print_apply_summary(result)
-    return result
-
-
 def undo_store_log(log_no: int) -> ApplyResult | None:
     """반영로그 No.의 변경 JSON을 역반영하여 실행취소 (점수·닉변)."""
     entry = get_log_index_entry(log_no)
@@ -890,220 +1144,8 @@ def undo_store_log(log_no: int) -> ApplyResult | None:
     return undo_points_log(log_no, parsed=parsed)
 
 
-def open_store_context():
-    ws_mapping, map_data = load_mapping_sheet()
-    alias_to_real, real_to_sheet, _, _ = load_alias_maps(map_data)
-    ws_store, rows, name_idx = load_store_sheet()
-    return {
-        "ws_mapping": ws_mapping,
-        "map_data": map_data,
-        "alias_to_real": alias_to_real,
-        "real_to_sheet": real_to_sheet,
-        "ws_store": ws_store,
-        "rows": rows,
-        "name_idx": name_idx,
-        "results_log": [],
-        "log_for_doc": {},
-        "cancelled": False,
-    }
-
-
-def store_apply_delta(
-    ctx: dict,
-    input_name: str,
-    delta: float,
-    log_detail: str,
-    *,
-    allow_cancel: bool = True,
-    skip_if_missing: bool = False,
-    new_row_formatter=None,
-) -> str | None:
-    """상점현황에 delta만큼 반영. target_name 반환, 취소 시 None."""
-    if ctx["cancelled"]:
-        return None
-    target, _ = resolve_member(input_name, ctx["alias_to_real"], ctx["real_to_sheet"])
-    ctx["log_for_doc"][target] = ctx["log_for_doc"].get(target, 0) + delta
-
-    if target in ctx["name_idx"]:
-        row = ctx["rows"][ctx["name_idx"][target]]
-        cur, new = apply_delta_to_row(row, delta)
-        ctx["results_log"].append(f"✅ {target}: {cur} → {new} ({log_detail})")
-        return target
-
-    if skip_if_missing:
-        print(f"[알림] '{target}'님을 상점현황에서 찾을 수 없어 건너뜁니다.")
-        return target
-
-    opts = "(예/아니요/취소)" if allow_cancel else "(예/아니요)"
-    ans = input(f"'({target})' 상점목록에 없습니다. 추가할까요? {opts}: ").strip()
-    if ans == "예":
-        val = new_row_formatter(delta) if new_row_formatter else format_score(delta)
-        ctx["rows"].append([target, val])
-        ctx["name_idx"][target] = len(ctx["rows"]) - 1
-        ctx["results_log"].append(f"✅ {target}: (신규) → {val}")
-    elif ans == "취소" and allow_cancel:
-        ctx["cancelled"] = True
-    return target
-
-
-def store_finalize(ctx: dict, title: str, timestamp: str, *, banner: str | None = None) -> ApplyResult | None:
-    if ctx["cancelled"] or not ctx["results_log"]:
-        return None
-    display = banner or title
-    result = ApplyResult(tool=display, timestamp=timestamp, member_count=len(ctx["log_for_doc"]))
-
-    print(f"\n[{display}] 변경 내역 ({len(ctx['results_log'])}건)")
-    for line in ctx["results_log"]:
-        print(line)
-
-    sheet_err = save_store_sheet(ctx["ws_store"], ctx["rows"])
-    if sheet_err:
-        result.sheet_error = sheet_err
-    else:
-        result.sheet_ok = True
-
-    if result.sheet_ok:
-        log_result = write_dual_log(
-            title, ctx["log_for_doc"], ctx["results_log"], timestamp,
-            store_rows=ctx["rows"],
-        )
-        result.merge_log(log_result)
-    else:
-        result.warnings.append("시트 저장 실패로 로그 기록을 건너뜀")
-
-    print_apply_summary(result)
-    return result
-
-
-def apply_calc_points_to_store(
-    calc_points: dict,
-    map_data: list,
-    ws_mapping,
-    timestamp: str,
-    season_label: str,
-    details_sort_helper: dict | None = None,
-) -> ApplyResult | None:
-    """메인 정산: 계산된 상벌점을 상점현황에 일괄 반영."""
-    alias_to_real, real_to_sheet, _, _ = load_alias_maps(map_data)
-    not_received = get_not_received(map_data)
-    ws_store, rows, name_idx = load_store_sheet()
-    log_for_doc: dict[str, float] = {}
-    results_log: list[str] = []
-    cancelled = False
-
-    for guild_member, point in calc_points.items():
-        target, real = resolve_member(guild_member, alias_to_real, real_to_sheet)
-        display = f"{real}({target})" if target != real else real
-        if target in not_received:
-            continue
-        log_for_doc[target] = log_for_doc.get(target, 0) + point
-
-        if target in name_idx:
-            row = rows[name_idx[target]]
-            cur, new = apply_delta_to_row(row, point)
-            results_log.append(f"✅ {display}: {cur} → {new} ({point:+})")
-        else:
-            while True:
-                ans = input(f"'({target})'은 상점 목록에 없습니다. 추가할까요? (예/아니요/취소): ").strip()
-                if ans == "예":
-                    rows.append([target, format_point(point)])
-                    results_log.append(f"✅ {display}: (신규) → {format_point(point)}")
-                    break
-                if ans == "아니요":
-                    nr_col = ws_mapping.col_values(5)
-                    ws_mapping.update(values=[[target]], range_name=f"E{len(nr_col) + 1}")
-                    break
-                if ans == "취소":
-                    cancelled = True
-                    break
-                print("[알림] '예', '아니요' 또는 '취소'로 입력해주세요.")
-            if cancelled:
-                break
-
-    if cancelled:
-        return None
-
-    log_title = f"{season_label} 시즌 상벌점 반영"
-    result = ApplyResult(
-        tool=log_title,
-        timestamp=timestamp,
-        member_count=len(log_for_doc),
-    )
-
-    print(f"\n[{log_title}] 변경 내역 ({len(results_log)}건)")
-    for line in results_log:
-        print(line)
-
-    sheet_err = save_store_sheet(ws_store, rows)
-    if sheet_err:
-        result.sheet_error = sheet_err
-    else:
-        result.sheet_ok = True
-
-    if result.sheet_ok:
-        log_result = write_dual_log(
-            log_title,
-            log_for_doc,
-            results_log,
-            timestamp,
-            details_sort_helper=details_sort_helper,
-            store_rows=rows,
-        )
-        result.merge_log(log_result)
-    else:
-        result.warnings.append("시트 저장 실패로 로그 기록을 건너뜀")
-
-    print_apply_summary(result)
-    return result
-
-
-def get_or_create_worksheet(spreadsheet, title: str, headers: list | None = None):
-    try:
-        return spreadsheet.worksheet(title)
-    except gspread.exceptions.WorksheetNotFound:
-        ncol = max(len(headers), 6) if headers else 6
-        ws = spreadsheet.add_worksheet(title=title, rows="1000", cols=str(ncol))
-        if headers:
-            end = col_letter(len(headers) - 1)
-            ws.update(range_name=f"A1:{end}1", values=[headers])
-        return ws
-
-
-def sync_kv(ws, input_text: str, sub_col: int, main_col: int) -> None:
-    pairs = parse_kv_input(input_text)
-    if not pairs:
-        return
-    current = ws.get_all_values()
-    key_map = {
-        row[main_col]: i + 1
-        for i, row in enumerate(current)
-        if len(row) > main_col and row[main_col].strip()
-    }
-    for main, sub in pairs:
-        if main in key_map:
-            ws.update(range_name=f"{col_letter(sub_col)}{key_map[main]}", values=[[sub]])
-        else:
-            next_row = len(ws.col_values(main_col + 1)) + 1
-            left_col = col_letter(min(sub_col, main_col))
-            right_col = col_letter(max(sub_col, main_col))
-            row_vals = [sub, main] if sub_col < main_col else [main, sub]
-            ws.update(range_name=f"{left_col}{next_row}:{right_col}{next_row}", values=[row_vals])
-            key_map[main] = next_row
-
-
-def sync_not_received(ws, input_text: str) -> None:
-    names = [n.strip() for n in re.split(r"[\s,]+", input_text.strip()) if n.strip()]
-    if not names:
-        return
-    existing = set(ws.col_values(5)[1:])
-    to_add = [[n] for n in names if n not in existing]
-    if to_add:
-        next_row = len(ws.col_values(5)) + 1
-        ws.update(range_name=f"E{next_row}", values=to_add)
-
-
 # ---------------------------------------------------------------------------
-# 공통 규칙 (`규칙` 시트 2행 단일)
+# 규칙 시트
 # ---------------------------------------------------------------------------
 
 RULES_SHEET_NAME = "규칙"
@@ -1126,59 +1168,12 @@ RULES_SHEET_HEADERS = [
 ]
 
 
-def absent_penalty_per_miss(rules: dict, is_sub_account: bool) -> float:
-    raw = rules["sub_absent_penalty"] if is_sub_account else rules["main_absent_penalty"]
-    return abs(float(raw)) - 2
-
-
-def parse_optional_float(raw) -> float | None:
-    s = str(raw).strip()
-    if not s or s.lower() in ("nan", "none", "#n/a"):
-        return None
-    try:
-        return float(s.replace(",", ""))
-    except ValueError:
-        return None
-
-
-def count_accidents_vs_manual_avg(
-    run_values: list,
-    manual_avg: float,
-    threshold_pct: float,
-) -> int:
-    """
-    1~9회 딜 중 (회차값 / 수동입력 평딜) * 100 이 threshold_pct 미만인 횟수.
-    0(미참) 회차는 참사 카운트에서 제외한다.
-    """
-    if manual_avg <= 0:
-        return 0
-    n = 0
-    for v in run_values:
-        try:
-            fv = float(v)
-        except (TypeError, ValueError):
-            continue
-        if fv <= 0:
-            continue
-        if (fv / manual_avg) * 100 < threshold_pct:
-            n += 1
-    return n
-
-
 def _rules_col_index(header: list[str], name: str) -> int:
     name_clean = name.strip().replace(" ", "")
     for i, h in enumerate(header):
         if h.strip().replace(" ", "") == name_clean:
             return i
     return -1
-
-
-def _parse_num(raw: str, as_float: bool = False):
-    raw = str(raw).strip()
-    if not raw:
-        return None
-    clean = raw.replace(",", "")
-    return float(clean) if as_float else int(float(clean))
 
 
 def _rules_cell(row: list, header: list[str], col_name: str, *, as_float: bool = False):
@@ -1260,6 +1255,97 @@ def rules_to_legacy_rules(rules: dict) -> dict[str, list[int]]:
     }
 
 
+def absent_penalty_per_miss(rules: dict, is_sub_account: bool) -> float:
+    raw = rules["sub_absent_penalty"] if is_sub_account else rules["main_absent_penalty"]
+    return abs(float(raw)) - 2
+
+
+def count_accidents_vs_manual_avg(
+    run_values: list,
+    manual_avg: float,
+    threshold_pct: float,
+) -> int:
+    """
+    1~9회 딜 중 (회차값 / 수동입력 평딜) * 100 이 threshold_pct 미만인 횟수.
+    0(미참) 회차도 참사로 카운트한다.
+    """
+    if manual_avg <= 0:
+        return 0
+    n = 0
+    for v in run_values:
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if fv <= 0:
+            n += 1
+            continue
+        if (fv / manual_avg) * 100 < threshold_pct:
+            n += 1
+    return n
+
+
+def rules_snapshot_rows(rules: dict) -> list[list[str]]:
+    """시즌 시트 상단에 붙일 규칙 스냅샷 행."""
+    rows = [["=== 적용 규칙 (정산 시점 스냅샷) ===", ""]]
+    if rules.get("settlement_season"):
+        rows.append(["정산 시즌", rules["settlement_season"]])
+    rows.append(["JSON", json.dumps(rules, ensure_ascii=False)])
+    rows.append([""])
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# 출력 / 프리뷰
+# ---------------------------------------------------------------------------
+
+def print_apply_summary(result: ApplyResult) -> None:
+    """반영 결과를 단계별로 출력한다."""
+    def _status(ok: bool) -> str:
+        return "✅ 성공" if ok else "❌ 실패"
+
+    print("\n" + "=" * 42)
+    print("반영 결과 요약")
+    print("=" * 42)
+    if result.tool:
+        print(f"도구     : {result.tool}")
+    if result.timestamp:
+        print(f"시각     : {result.timestamp}")
+    if result.member_count:
+        print(f"대상     : {result.member_count}명")
+    print(f"[상점현황 시트] {_status(result.sheet_ok)}")
+    if result.sheet_error:
+        print(f"  └ {result.sheet_error}")
+    if result.sheet_ok:
+        if result.machine_log_ok and result.machine_log_no:
+            print(f"[반영로그]    {_status(True)} → No. {result.machine_log_no} (실행취소용)")
+        else:
+            print(f"[반영로그]    {_status(False)}")
+            if result.machine_log_error:
+                print(f"  └ {result.machine_log_error}")
+        if result.machine_log_ok:
+            print(f"[상점 반영기록]   {_status(result.readable_log_ok)}")
+            if result.readable_log_error:
+                print(f"  └ {result.readable_log_error}")
+        else:
+            print("[상점 반영기록]   ⏭️ 건너뜀 (반영로그 없음)")
+    for w in result.warnings:
+        print(f"⚠️ {w}")
+    print("-" * 42)
+    if result.is_full_success:
+        print("전체 상태: ✅ 완료 (시트 + 로그 모두 반영)")
+    elif result.is_dangerous:
+        print("전체 상태: ⚠️ 부분 성공 (위험)")
+        print("  점수는 시트에 반영되었으나 반영로그 기록이 없습니다.")
+        print("  → 실행취소 도구로 복구할 수 없습니다. 수동 조정이 필요합니다.")
+    elif not result.sheet_ok:
+        print("전체 상태: ❌ 시트 반영 실패")
+    else:
+        print("전체 상태: ⚠️ 부분 성공")
+        print("  → 상점 반영기록만 실패한 경우, 반영로그 No.로 실행취소는 가능합니다.")
+    print("=" * 42 + "\n")
+
+
 def print_rules_preview(rules: dict) -> None:
     b = rules["bosses"]
     print("\n" + "=" * 42)
@@ -1291,16 +1377,3 @@ def print_rules_preview(rules: dict) -> None:
         f"본캐 {rules['main_absent_penalty']}점/회"
     )
     print("=" * 42 + "\n")
-
-
-def rules_snapshot_rows(rules: dict) -> list[list[str]]:
-    """시즌 시트 상단에 붙일 규칙 스냅샷 행."""
-    rows = [["=== 적용 규칙 (정산 시점 스냅샷) ===", ""]]
-    if rules.get("settlement_season"):
-        rows.append(["정산 시즌", rules["settlement_season"]])
-    rows.append(["JSON", json.dumps(rules, ensure_ascii=False)])
-    rows.append([""])
-    return rows
-
-
-
